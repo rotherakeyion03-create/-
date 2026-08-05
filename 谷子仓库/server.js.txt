@@ -1,0 +1,277 @@
+// server.js - 谷子仓库开团版后端
+import express from 'express';
+import cors from 'cors';
+import sqlite3 from 'sqlite3';
+import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || 'guzi-warehouse-secret-2024';
+
+app.use(cors());
+app.use(express.json());
+
+// 初始化SQLite数据库
+const db = new sqlite3.Database(join(__dirname, 'guzi.db'));
+
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    qq TEXT NOT NULL,
+    cn TEXT NOT NULL,
+    password_hash TEXT,
+    UNIQUE(qq)
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS groups_ (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    leader_qq TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS group_members (
+    group_id INTEGER NOT NULL,
+    qq TEXT NOT NULL,
+    cn TEXT NOT NULL,
+    role TEXT DEFAULT 'member', -- 'leader','admin','member'
+    PRIMARY KEY (group_id, qq),
+    FOREIGN KEY (group_id) REFERENCES groups_(id)
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS guzi (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id INTEGER NOT NULL,
+    cn TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    character_ TEXT,
+    type TEXT,
+    quantity INTEGER DEFAULT 1,
+    price REAL DEFAULT 0,
+    status TEXT DEFAULT '正常',
+    payment_status TEXT DEFAULT '已交肾',
+    payment_date TEXT,
+    added_date TEXT,
+    storage TEXT,
+    notes TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (group_id) REFERENCES groups_(id)
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id INTEGER NOT NULL,
+    sender_qq TEXT NOT NULL,
+    sender_cn TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (group_id) REFERENCES groups_(id)
+  )`);
+});
+
+// ========== 认证中间件 ==========
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: '未提供令牌' });
+  const token = authHeader.split(' ')[1];
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: '令牌无效' });
+  }
+}
+
+// ========== 用户认证 ==========
+app.post('/api/auth/login', (req, res) => {
+  const { qq, cn, password } = req.body;
+  db.get('SELECT * FROM users WHERE qq = ?', [qq], async (err, row) => {
+    if (err) return res.status(500).json({ error: '数据库错误' });
+    if (!row) {
+      // 新用户自动注册（密码可选，这里不验证密码）
+      const hash = password ? bcrypt.hashSync(password, 8) : null;
+      db.run('INSERT INTO users (qq, cn, password_hash) VALUES (?,?,?)', [qq, cn, hash], function (e) {
+        if (e) return res.status(500).json({ error: '注册失败' });
+        const user = { qq, cn, id: this.lastID };
+        const token = jwt.sign(user, JWT_SECRET, { expiresIn: '7d' });
+        // 自动查找该用户所在的团
+        db.all('SELECT group_id, role FROM group_members WHERE qq = ?', [qq], (e2, memberships) => {
+          const groups = memberships || [];
+          return res.json({ token, user: { ...user, groups } });
+        });
+      });
+    } else {
+      // 已存在用户直接登录
+      const user = { qq: row.qq, cn: row.cn, id: row.id };
+      const token = jwt.sign(user, JWT_SECRET, { expiresIn: '7d' });
+      db.all('SELECT group_id, role FROM group_members WHERE qq = ?', [qq], (e2, memberships) => {
+        const groups = memberships || [];
+        return res.json({ token, user: { ...user, groups } });
+      });
+    }
+  });
+});
+
+app.get('/api/auth/me', authMiddleware, (req, res) => {
+  const qq = req.user.qq;
+  db.get('SELECT * FROM users WHERE qq = ?', [qq], (err, row) => {
+    if (!row) return res.status(404).json({ error: '用户不存在' });
+    db.all('SELECT group_id, role FROM group_members WHERE qq = ?', [qq], (e2, memberships) => {
+      const groups = memberships || [];
+      let groupId = null;
+      if (groups.length > 0) groupId = groups[0].group_id; // 默认返回第一个团
+      res.json({ user: { qq: row.qq, cn: row.cn, id: row.id, groups, groupId } });
+    });
+  });
+});
+
+// ========== 团管理 ==========
+app.get('/api/groups', authMiddleware, (req, res) => {
+  db.all('SELECT * FROM groups_', (err, rows) => {
+    if (err) return res.status(500).json({ error: '数据库错误' });
+    res.json({ groups: rows });
+  });
+});
+
+app.post('/api/groups', authMiddleware, (req, res) => {
+  const { name } = req.body;
+  const leaderQq = req.user.qq;
+  db.run('INSERT INTO groups_ (name, leader_qq) VALUES (?,?)', [name, leaderQq], function (e) {
+    if (e) return res.status(500).json({ error: '创建失败' });
+    const groupId = this.lastID;
+    // 团长自动加入成员表
+    db.run('INSERT INTO group_members (group_id, qq, cn, role) VALUES (?,?,?,?)', [groupId, leaderQq, req.user.cn, 'leader'], (e2) => {
+      if (e2) return res.status(500).json({ error: '添加团长失败' });
+      res.json({ group: { id: groupId, name, leader_qq: leaderQq } });
+    });
+  });
+});
+
+// 添加管理员
+app.post('/api/groups/:groupId/admins', authMiddleware, (req, res) => {
+  const groupId = req.params.groupId;
+  const { qq, cn } = req.body;
+  // 权限检查：必须是团长
+  db.get('SELECT role FROM group_members WHERE group_id = ? AND qq = ?', [groupId, req.user.qq], (err, row) => {
+    if (!row || row.role !== 'leader') return res.status(403).json({ error: '只有团长能添加管理员' });
+    db.run('INSERT OR REPLACE INTO group_members (group_id, qq, cn, role) VALUES (?,?,?,?)', [groupId, qq, cn, 'admin'], (e) => {
+      if (e) return res.status(500).json({ error: '添加失败' });
+      res.json({ success: true });
+    });
+  });
+});
+
+// 移除管理员
+app.delete('/api/groups/:groupId/admins/:qq', authMiddleware, (req, res) => {
+  const groupId = req.params.groupId;
+  const targetQq = req.params.qq;
+  db.get('SELECT role FROM group_members WHERE group_id = ? AND qq = ?', [groupId, req.user.qq], (err, row) => {
+    if (!row || row.role !== 'leader') return res.status(403).json({ error: '只有团长能移除管理员' });
+    db.run('DELETE FROM group_members WHERE group_id = ? AND qq = ? AND role = ?', [groupId, targetQq, 'admin'], (e) => {
+      if (e) return res.status(500).json({ error: '移除失败' });
+      res.json({ success: true });
+    });
+  });
+});
+
+// 转移团长
+app.post('/api/groups/:groupId/transfer', authMiddleware, (req, res) => {
+  const groupId = req.params.groupId;
+  const { newLeaderQq } = req.body;
+  db.get('SELECT role FROM group_members WHERE group_id = ? AND qq = ?', [groupId, req.user.qq], (err, row) => {
+    if (!row || row.role !== 'leader') return res.status(403).json({ error: '只有团长能转移' });
+    db.run('UPDATE group_members SET role = ? WHERE group_id = ? AND qq = ?', ['leader', groupId, newLeaderQq], (e) => {
+      if (e) return res.status(500).json({ error: '转移失败' });
+      db.run('UPDATE group_members SET role = ? WHERE group_id = ? AND qq = ?', ['member', groupId, req.user.qq], (e2) => {
+        db.run('UPDATE groups_ SET leader_qq = ? WHERE id = ?', [newLeaderQq, groupId], () => {
+          res.json({ success: true });
+        });
+      });
+    });
+  });
+});
+
+// 添加团员
+app.post('/api/groups/:groupId/members', authMiddleware, (req, res) => {
+  const groupId = req.params.groupId;
+  const { qq, cn } = req.body;
+  db.run('INSERT OR IGNORE INTO group_members (group_id, qq, cn, role) VALUES (?,?,?,?)', [groupId, qq, cn, 'member'], (e) => {
+    if (e) return res.status(500).json({ error: '添加失败' });
+    res.json({ success: true });
+  });
+});
+
+// ========== 谷子操作 ==========
+app.get('/api/groups/:groupId/guzi', authMiddleware, (req, res) => {
+  const groupId = req.params.groupId;
+  const userQq = req.user.qq;
+  // 检查用户在该团的角色
+  db.get('SELECT role FROM group_members WHERE group_id = ? AND qq = ?', [groupId, userQq], (err, row) => {
+    if (!row) return res.status(403).json({ error: '您不在该团中' });
+    const role = row.role;
+    let query = 'SELECT * FROM guzi WHERE group_id = ?';
+    const params = [groupId];
+    if (role === 'member') {
+      // 团员只能看自己的谷子
+      db.get('SELECT cn FROM users WHERE qq = ?', [userQq], (e, userRow) => {
+        if (!userRow) return res.status(404).json({ error: '用户信息缺失' });
+        query += ' AND cn = ?';
+        params.push(userRow.cn);
+        db.all(query, params, (e2, rows) => res.json({ guzi: rows }));
+      });
+    } else {
+      // 团长/管理员看所有
+      db.all(query, params, (e2, rows) => res.json({ guzi: rows }));
+    }
+  });
+});
+
+app.post('/api/groups/:groupId/guzi', authMiddleware, (req, res) => {
+  const groupId = req.params.groupId;
+  const { cn, ip, character, type, quantity, price, status, payment_status, payment_date, added_date, storage, notes } = req.body;
+  db.run(`INSERT INTO guzi (group_id, cn, ip, character_, type, quantity, price, status, payment_status, payment_date, added_date, storage, notes) 
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [groupId, cn, ip, character, type, quantity, price, status, payment_status, payment_date, added_date, storage, notes],
+    function(e) { if (e) return res.status(500).json({ error: '添加失败' }); res.json({ id: this.lastID }); });
+});
+
+app.put('/api/groups/:groupId/guzi/:id', authMiddleware, (req, res) => {
+  const { id } = req.params;
+  const { cn, ip, character, type, quantity, price, status, payment_status, payment_date, added_date, storage, notes } = req.body;
+  db.run(`UPDATE guzi SET cn=?, ip=?, character_=?, type=?, quantity=?, price=?, status=?, payment_status=?, payment_date=?, added_date=?, storage=?, notes=? WHERE id=?`,
+    [cn, ip, character, type, quantity, price, status, payment_status, payment_date, added_date, storage, notes, id],
+    (e) => { if (e) return res.status(500).json({ error: '更新失败' }); res.json({ success: true }); });
+});
+
+app.delete('/api/groups/:groupId/guzi/:id', authMiddleware, (req, res) => {
+  db.run('DELETE FROM guzi WHERE id = ?', [req.params.id], (e) => {
+    if (e) return res.status(500).json({ error: '删除失败' }); res.json({ success: true });
+  });
+});
+
+// ========== 留言 ==========
+app.post('/api/groups/:groupId/messages', authMiddleware, (req, res) => {
+  const groupId = req.params.groupId;
+  const { content } = req.body;
+  db.run('INSERT INTO messages (group_id, sender_qq, sender_cn, content) VALUES (?,?,?,?)',
+    [groupId, req.user.qq, req.user.cn, content],
+    (e) => { if (e) return res.status(500).json({ error: '发送失败' }); res.json({ success: true }); });
+});
+
+app.get('/api/groups/:groupId/messages', authMiddleware, (req, res) => {
+  const groupId = req.params.groupId;
+  db.all('SELECT * FROM messages WHERE group_id = ? ORDER BY created_at DESC', [groupId], (err, rows) => {
+    if (err) return res.status(500).json({ error: '加载失败' });
+    res.json({ messages: rows });
+  });
+});
+
+// 提供前端静态文件（如果需要将前端与后端放在一起部署）
+app.use(express.static(join(__dirname, 'public')));
+
+app.listen(PORT, () => {
+  console.log(`谷子仓库后端已启动：http://localhost:${PORT}`);
+});
